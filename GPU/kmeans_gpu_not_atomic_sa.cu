@@ -32,6 +32,7 @@ int main(int argc, char *argv[]) {
     } else {
         in = stdin;
     }
+    
     //Parse file
     fscanf(in, "%d %d %d\n", &n ,&k, &dim);
     points = create_2D_double_array(n, dim);
@@ -143,10 +144,10 @@ int main(int argc, char *argv[]) {
     //So this probably will need some tuning depending on the dataset
     //for the input.in start=100 and final=50, are working great
     //for dataset 100_5_2_0 from my random generator start=100000 and final=50000 work good.
-    double start_temp = 80000.0;
+    double start_temp = 100000.0;
     double temp = start_temp/log(1 + step);
     double final_temp = 50000.0;
-    int eq_iterations = 2000;
+    int eq_iterations = 1800;
     double best_cost = DBL_MAX;
     bool best_found = false;
 

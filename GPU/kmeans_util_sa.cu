@@ -223,12 +223,14 @@ void find_cluster_SA_on_gpu(const double *dev_points, const double *dev_centers,
             double d_from_current = 0.0;
             for (int j = 0; j < k; j++){
                 //printf("Thread: %3d current result: %d %lf \n", index, j,  result_clusters[j*n + i]);
-                if (result_clusters[j*n + i] > 0.0) {
-                  d_from_current = sqrt(squared_distance_on_gpu(&dev_points[i], &local_centers[j], n, k, dim));
+                if (result_clusters[j*n + i] > EPS) {
+                  d_from_current = squared_distance_on_gpu(&dev_points[i], &local_centers[j], n, k, dim);
                   old_cluster = j;
-                  break;
                 }
-            }
+            
+            }            
+            d_from_current = sqrt(d_from_current);
+            
             if (old_cluster > k){
                 printf("Thread: %3d POU STO POUTSO BRHKE TETOIES MALAKIES\n", index);
             }
@@ -243,9 +245,10 @@ void find_cluster_SA_on_gpu(const double *dev_points, const double *dev_centers,
                     new_cluster = j;
                 }
             }
+            min = sqrt(min);
 
             //Check if the move is gonna be done
-            double prob = exp(-abs(d_from_current - min)/sa_temp); //TODO: upload 1/sa_temp
+            double prob = exp(-abs(d_from_current - min) * sa_temp); //TODO: upload 1/sa_temp
             double unif = curand_uniform(&devStates[index]);
             //printf("Thread: %3d Temp : %lf Prob %4.3lf Unif %4.1lf Take Move:%d \n", index, sa_temp, prob, unif, prob > unif);
             if (prob > unif) {
@@ -325,7 +328,7 @@ void swap(double* src, double* dst){
 }
 
 
-__global__ void sum_distances(double* dev_points, double* dev_centers_of_points, double* sum, int n, int k, int dim){
+__global__ void sum_distances(double* dev_points, double* dev_centers_of_points, double* dev_points_help, double* sum, int n, int k, int dim){
     int index = get_global_tid();
 
     if(index < n){
@@ -334,9 +337,11 @@ __global__ void sum_distances(double* dev_points, double* dev_centers_of_points,
             double temp = dev_centers_of_points[index + i] - dev_points[index + i];
             dist += temp * temp;
         }
-        dist = sqrt(dist);
 
-        atomicAdd(sum, dist); //{TODO: OPTIMIZE WITH REDUCTION}
+        dist = sqrt(dist);
+        dev_points_help[index] = dist;
+        
+        //atomicAdd(sum, dist); //{TODO: OPTIMIZE WITH REDUCTION}
     }
 }
 
@@ -374,11 +379,14 @@ double evaluate_solution(double* dev_points,
     
     cudaMemset(dev_cost, 0x0, sizeof(double));
     //Calculate distances and cost 
-    sum_distances<<<gpu_grid, gpu_block>>>(dev_points, dev_centers_of_points, dev_cost, n, k, dim);
-    //printf("CUDA Check: %s\n", gpu_get_last_errmsg());
+    sum_distances<<<gpu_grid, gpu_block>>>(dev_points, dev_centers_of_points, dev_points_help, dev_cost, n, k, dim);
     cudaDeviceSynchronize();
-    copy_from_gpu(&cost, dev_cost, sizeof(double));
 
+    //Get cost with cublas
+    stat = cublasDasum(handle, n, dev_points_help, 1, &cost);
+
+    //printf("CUDA Check: %s\n", gpu_get_last_errmsg());
+    //copy_from_gpu(&cost, dev_cost, sizeof(double));
 
     return cost;
 }
@@ -427,10 +435,12 @@ double kmeans_on_gpu(
     cudaDeviceSynchronize();
     
     //Upload Temperature to constant memory
+    temp = 1.0/temp;
     cudaMemcpyToSymbol(sa_temp, &temp, sizeof(double), 0, cudaMemcpyHostToDevice);
     
-    /*
+    
     // assign points to clusters - step 1
+    /*
     find_cluster_on_gpu<<<gpu_grid,gpu_block, k*dim*sizeof(double)>>>(
         dev_points,
         dev_centers,
@@ -438,9 +448,9 @@ double kmeans_on_gpu(
         dev_points_clusters);
     cudaDeviceSynchronize();
     */
-
     
     //STEP 1 WITH SA
+    
     find_cluster_SA_on_gpu<<<gpu_grid, gpu_block, k*dim*sizeof(double)>>>(
         dev_points,
         dev_centers,
@@ -449,7 +459,7 @@ double kmeans_on_gpu(
         devStates);
     //printf("SA Kernel Check: %s\n", gpu_get_last_errmsg());
     cudaDeviceSynchronize();
-
+    
     
 
     // update means - step 2

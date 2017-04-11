@@ -4,7 +4,7 @@ CUDA_FLAGS=-O3 -D_FORCE_INLINES
 CUDA_PREFIX=/opt/cuda-7.5
 GPU_COMP?=nvcc
 GPU_BACKEND=g++
-GPU_FLAGS=--ptxas-options=-v --compiler-options -Wall
+GPU_FLAGS=--ptxas-options=-v --compiler-options -Wall -use_fast_math
 GPU_ARCH=-arch sm_20
 CUBLAS=-lcublas
 CUBLAS_PATH=-L$(CUDA_PREFIX)/lib64
@@ -27,7 +27,8 @@ check_architectures: check_architecture.cu
 
 run:
 	# ./kmeans_gpu 256 "../data/road_spatial_network_dataset/spatial_network.data"
-	./kmeans_gpu 256 "../data/dataset_100_5_2_0"
+	# ./kmeans_gpu 256 "../data/dataset_100_5_2_0"
+	./kmeans_gpu 256 "../data/dataset_50000_50_2_1"
 	# ./kmeans_gpu 32 "../data/input.in"
 	# ./kmeans_gpu < ../data/input.in
 	
