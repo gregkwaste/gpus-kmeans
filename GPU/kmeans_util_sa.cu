@@ -64,6 +64,19 @@ double squared_distance_on_gpu(const double* ps, const double* center, const int
     return sum;
 }
 
+__device__
+double normalized_squared_distance_on_gpu(const double* ps, const double* center, const int n, const int k, const int dim) {
+    double sum = 0;
+    for (int i = 0, j=0; i < dim*n; i+=n,j+=k){
+        //calculate normalized distance
+        double temp = center[j] - ps[i];    
+        //printf("Thread %3d Mean %lf Variance %lf Temp %lf Partsum %lf \n", threadIdx.x,  mean, v1, temp * temp,  sum);
+        sum += temp * temp / 2.0;
+    }
+    
+    return sum;
+}
+
 void transpose(double** src, double* dst, int n, int m){
     int i, j;
     for(i=0; i<n; i++){
@@ -167,6 +180,7 @@ void find_cluster_on_gpu(const double *dev_points, const double *dev_centers,
                 dist = squared_distance_on_gpu(&dev_points[i], &local_centers[j], n, k, dim);
 
                 if (min > dist){
+                    //printf("Thread: %3d Found better cluster %d \n", index, j);
                     min = dist;
                     cluster_it_belongs = j;
                 }
@@ -185,9 +199,77 @@ void find_cluster_on_gpu(const double *dev_points, const double *dev_centers,
     }
 }
 
-__global__ void setup_RNG_states(curandState *devStates,  unsigned long seed){
+
+__global__
+void find_cluster_on_gpu3(const double *dev_points, const double *dev_centers, 
+                         const int n, const int k, const int dim, 
+                         double *result_clusters, int *result_clusters_old) {
+
+    double min, dist;
+    int cluster_it_belongs;
+    const unsigned int index = get_global_tid();
+    const unsigned int thread_id = threadIdx.x;
+    extern __shared__ double local_centers[];
+
+    const unsigned int start = index;
+    const unsigned int end = start + 1;
+
+    // WARNING: Mporei na dhmiourgithei provlhma an ta threads sto block einai ligotera apo to k*dim
+    if(thread_id < k*dim){
+        local_centers[thread_id] = dev_centers[thread_id];
+    }
+    __syncthreads();
+
+    if (index < n){
+        for (int i = start; i < end; i++){
+            min = DBL_MAX;
+            for (int j = 0; j < k; j++){
+                result_clusters[j*n + i] = 0.0;
+                dist = squared_distance_on_gpu(&dev_points[i], &local_centers[j], n, k, dim);
+
+                if (min > dist){
+                    min = dist;
+                    cluster_it_belongs = j;
+                }
+                
+            }
+            result_clusters[cluster_it_belongs*n + i] = 1.0;
+            result_clusters_old[i] = cluster_it_belongs;
+        }
+    }
+}
+
+__global__
+void SAGM_perturbation(double *dev_centers, 
+                       const int k, const int dim, 
+                       curandState *devStates) {
+
+    const unsigned int index = get_global_tid();
+    
+    if (index < k) {
+        //The original algorithm chooses one random cluster.
+        //This is gonna be way too inefficient with a gpu so the algorithm 
+        //is modified and all the centers will be perturbed simultanuously
+        double delta = 0.0005;
+        //Perturb Center
+        //int rand_center = (int) curand_uniform(&devStates[index]) * (k-1);
+        
+        for (int i=0; i<k*dim; i+=k){
+            double unif = delta*(2.0*curand_uniform(&devStates[index]) - 1.0)*1024.0;
+            double old = dev_centers[index+i];
+            dev_centers[index + i] += unif; 
+            //printf("Thread: %d modified Center %d from %lf to %lf \n", index, index, old, dev_centers[index + i]);
+        }
+        
+
+    }
+}
+
+
+__global__ void init_RNG(curandState *devStates,  unsigned long seed){
     const unsigned int index = get_global_tid();
     //Init curand for each thread
+    //printf("Thread ID: %d Setting Seed %ld \n", index, seed);
     curand_init(seed, index, 0, &devStates[index]);
 }
 
@@ -198,9 +280,9 @@ __device__ double calc_SA_prob(double de,  double dmin,  curandState* state){
 }
 
 __global__
-void find_cluster_SA_on_gpu(const double *dev_points, const double *dev_centers, 
+void SAKM_perturbation(const double *dev_points, const double *dev_centers, 
                          const int n, const int k, const int dim, 
-                         double *result_clusters, curandState *devStates) {
+                         double *result_clusters, int *result_clusters_old, curandState *devStates) {
 
     double min, dist;
     int old_cluster,  new_cluster;
@@ -219,45 +301,45 @@ void find_cluster_SA_on_gpu(const double *dev_points, const double *dev_centers,
 
     if (index < n) {
         for (int i = start; i < end; i++){
-            //Since we're not saving the point-cluster assignment directly anymore we should retrieve it at this point    
             double d_from_current = 0.0;
-            for (int j = 0; j < k; j++){
-                //printf("Thread: %3d current result: %d %lf \n", index, j,  result_clusters[j*n + i]);
-                if (result_clusters[j*n + i] > EPS) {
-                  d_from_current = squared_distance_on_gpu(&dev_points[i], &local_centers[j], n, k, dim);
-                  old_cluster = j;
-                }
+            //Fetch current cluster
+            old_cluster = result_clusters_old[i];
+            d_from_current = squared_distance_on_gpu(&dev_points[i], &local_centers[old_cluster], n, k, dim);
             
-            }            
-            d_from_current = sqrt(d_from_current);
-            
-            if (old_cluster > k){
-                printf("Thread: %3d POU STO POUTSO BRHKE TETOIES MALAKIES\n", index);
-            }
-
             //Find best candidate
             min = DBL_MAX;
+            new_cluster = old_cluster;
             for (int j = 0; j < k; j++){
                 result_clusters[j*n + i] = 0.0;
+                if (j == old_cluster) continue;
                 dist = squared_distance_on_gpu(&dev_points[i], &local_centers[j], n, k, dim);
-                if (min > dist){
+                //printf("Thread: %3d Checking %d %lf vs %d %lf \n", index, old_cluster, d_from_current, j, dist);
+                if (min - dist > EPS){
                     min = dist;
                     new_cluster = j;
                 }
             }
+            d_from_current = sqrt(d_from_current);
             min = sqrt(min);
 
-            //Check if the move is gonna be done
-            double prob = exp(-abs(d_from_current - min) * sa_temp); //TODO: upload 1/sa_temp
+
+            double prob = exp( -abs(min - d_from_current) * sa_temp );
             double unif = curand_uniform(&devStates[index]);
-            //printf("Thread: %3d Temp : %lf Prob %4.3lf Unif %4.1lf Take Move:%d \n", index, sa_temp, prob, unif, prob > unif);
+            
+            //printf("Thread: %3d Old Center: %d %lf New Center %d %lf \n", index, old_cluster, d_from_current,  new_cluster,  min);
+            //printf("Thread: %3d Temp : %lf exp(_x) %lf %lf Prob %4.3lf Unif %4.1lf Take Move:%d \n",
+            //        index, 1.0/sa_temp, d_from_current, min,  prob, unif, prob > unif);
+            
             if (prob > unif) {
                 result_clusters[new_cluster*n + i] = 1.0;
-            } else{
+                result_clusters_old[i] = new_cluster;
+            } else {
                 //Get back
                 result_clusters[old_cluster*n + i] = 1.0;
+                result_clusters_old[i] = old_cluster;
             }
-
+            
+             
         }
     }
 }
@@ -313,7 +395,6 @@ void call_create_dev_ones(double* dev_ones, int n, dim3 gpu_grid, dim3 gpu_block
     cudaDeviceSynchronize();
 }
 
-
 void swap(double** src, double** dst){
     double *temp = *src;
     *src = *dst;
@@ -328,7 +409,7 @@ void swap(double* src, double* dst){
 }
 
 
-__global__ void sum_distances(double* dev_points, double* dev_centers_of_points, double* dev_points_help, double* sum, int n, int k, int dim){
+__global__ void sum_distances(double* dev_points, double* dev_centers_of_points, double* dev_points_help, int n, int k, int dim){
     int index = get_global_tid();
 
     if(index < n){
@@ -338,10 +419,8 @@ __global__ void sum_distances(double* dev_points, double* dev_centers_of_points,
             dist += temp * temp;
         }
 
-        dist = sqrt(dist);
+        //dist = sqrt(dist);
         dev_points_help[index] = dist;
-        
-        //atomicAdd(sum, dist); //{TODO: OPTIMIZE WITH REDUCTION}
     }
 }
 
@@ -351,7 +430,6 @@ double evaluate_solution(double* dev_points,
                        double* dev_points_clusters, 
                        double* dev_centers_of_points, 
                        double* dev_points_help, 
-                       double* dev_cost, 
                        int n, int k, int dim, 
                        dim3 gpu_grid, dim3 gpu_block, 
                        //CUBLAS stuff
@@ -377,20 +455,15 @@ double evaluate_solution(double* dev_points,
 
     alpha = -1.0;
     
-    cudaMemset(dev_cost, 0x0, sizeof(double));
     //Calculate distances and cost 
-    sum_distances<<<gpu_grid, gpu_block>>>(dev_points, dev_centers_of_points, dev_points_help, dev_cost, n, k, dim);
+    sum_distances<<<gpu_grid, gpu_block>>>(dev_points, dev_centers_of_points, dev_points_help, n, k, dim);
     cudaDeviceSynchronize();
 
     //Get cost with cublas
     stat = cublasDasum(handle, n, dev_points_help, 1, &cost);
 
-    //printf("CUDA Check: %s\n", gpu_get_last_errmsg());
-    //copy_from_gpu(&cost, dev_cost, sizeof(double));
-
     return cost;
 }
-
 
 double kmeans_on_gpu(
             double* dev_points,
@@ -398,19 +471,16 @@ double kmeans_on_gpu(
             int n, int k, int dim,
             double* dev_points_clusters,
             double* dev_points_in_cluster,
-            double* dev_centers_of_points,
+            double *dev_centers_of_points, 
             double* dev_new_centers,
             int* dev_check,
-            double* dev_cost,
             int BLOCK_SIZE, 
             //CUBLAS Shit
             cublasHandle_t handle,
             cublasStatus_t stat,
             double* dev_ones,
             double* dev_points_help, 
-            double* dev_temp_centers, 
-            curandState* devStates, 
-            double temp) {
+            double* dev_temp_centers) {
 
     double alpha = 1.0, beta = 0.0;
 
@@ -418,50 +488,19 @@ double kmeans_on_gpu(
     int grid_size = (n+BLOCK_SIZE-1)/BLOCK_SIZE;
     dim3 gpu_grid(grid_size, 1);
     dim3 gpu_block(BLOCK_SIZE, 1);
-    int thread_num = grid_size * BLOCK_SIZE;
     
-    //printf("Grid size : %dx%d\n", gpu_grid.x, gpu_grid.y);
-    //printf("Block size: %dx%d\n", gpu_block.x, gpu_block.y);
+    // printf("Grid size : %dx%d\n", gpu_grid.x, gpu_grid.y);
+    // printf("Block size: %dx%d\n", gpu_block.x, gpu_block.y);
     // printf("Shared memory size: %ld bytes\n", shmem_size);
-    
-    //For now I'll be allocating and destroying the array until we move it outside this func
-    //This can be solved by moving the grid, block calculations outside of this func
-    cudaMalloc(&devStates,  thread_num*sizeof(curandState));
 
-    //Setup States
-    unsigned long seed = rand();
-    //printf("Setting Seed to curandgen: %ld\n", seed);
-    setup_RNG_states<<<gpu_grid, gpu_block>>>(devStates, seed);
-    cudaDeviceSynchronize();
-    
-    //Upload Temperature to constant memory
-    temp = 1.0/temp;
-    cudaMemcpyToSymbol(sa_temp, &temp, sizeof(double), 0, cudaMemcpyHostToDevice);
-    
-    
     // assign points to clusters - step 1
-    /*
     find_cluster_on_gpu<<<gpu_grid,gpu_block, k*dim*sizeof(double)>>>(
         dev_points,
         dev_centers,
         n, k, dim,
         dev_points_clusters);
     cudaDeviceSynchronize();
-    */
     
-    //STEP 1 WITH SA
-    
-    find_cluster_SA_on_gpu<<<gpu_grid, gpu_block, k*dim*sizeof(double)>>>(
-        dev_points,
-        dev_centers,
-        n, k, dim,
-        dev_points_clusters, 
-        devStates);
-    //printf("SA Kernel Check: %s\n", gpu_get_last_errmsg());
-    cudaDeviceSynchronize();
-    
-    
-
     // update means - step 2
     cublasDgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N,
                 k, dim, n,
@@ -488,20 +527,6 @@ double kmeans_on_gpu(
         dev_points_in_cluster);
     cudaDeviceSynchronize();
     
-
-    //Evaluate current solution
-    double cost = evaluate_solution(dev_points, dev_new_centers, dev_points_clusters, 
-                                                      dev_centers_of_points, dev_points_help, dev_cost, 
-                                                      n, k, dim, 
-                                                      gpu_grid, gpu_block, 
-                                                      handle, stat);
-    
-    //Delete random array
-    cudaFree(devStates);
-
-    /*
-    We are not checking for convergence with SA
-
     //Check for convergence with CUBLAS
     //dev_new_centers and dev_centers arrays are actually checked for equality
     //No distances are calculated separately for each center point.
@@ -523,9 +548,137 @@ double kmeans_on_gpu(
     //Update new centers
     // TODO: Swap pointers
     cudaMemcpy(dev_centers, dev_new_centers, sizeof(double)*k*dim, cudaMemcpyDeviceToDevice);
-    
 
+    return 0.0;
+}
+
+void setup_RNG_states(curandState* devStates, dim3 gpu_grid, dim3 gpu_block){
+    unsigned long seed = rand();
+    //printf("Setting Seed to curandgen: %ld\n", seed);
+    init_RNG<<<gpu_grid, gpu_block>>>(devStates, seed);
+    //printf("SETUP RNG - CUDA Check: %s\n", gpu_get_last_errmsg());
+    cudaDeviceSynchronize();    
+}
+
+void init_point_clusters(double *dev_points, double *dev_centers, 
+                         int n, int k, int dim, 
+                         dim3 gpu_grid, dim3 gpu_block, 
+                         double *result_clusters, int *result_clusters_old, 
+                         curandState *devStates){
+
+    //Init result_cluster arrays to 0
+    cudaMemset(result_clusters, 0x0, n*k*sizeof(double));
+    cudaMemset(result_clusters_old, 0x0, n*sizeof(int));
+
+    find_cluster_on_gpu3<<<gpu_grid, gpu_block, k*dim*sizeof(double)>>>(dev_points, dev_centers, 
+                                                  n, k, dim, 
+                                                  result_clusters, result_clusters_old);
+    //printf("Init Point Clusters - CUDA Check: %s\n", gpu_get_last_errmsg());
+    cudaDeviceSynchronize();
+}
+
+double kmeans_on_gpu_SA(
+            double* dev_points,
+            double* dev_centers,
+            int n, int k, int dim,
+            double* dev_points_clusters,
+            int* dev_points_clusters_old,
+            double* dev_points_in_cluster,
+            double* dev_centers_of_points,
+            double* dev_new_centers,
+            int* dev_check,
+            dim3 gpu_grid, 
+            dim3 gpu_block, 
+            //CUBLAS Shit
+            cublasHandle_t handle,
+            cublasStatus_t stat,
+            double* dev_ones,
+            double* dev_points_help, 
+            double* dev_temp_centers, 
+            curandState* devStates, 
+            double temp) {
+
+    double alpha = 1.0, beta = 0.0;
+
+    //Upload Temperature to constant memory
+    //temp = 1.0/temp;
+    //cudaMemcpyToSymbol(sa_temp, &temp, sizeof(double), 0, cudaMemcpyHostToDevice);
+    
+    
+    //STEP 1 WITH SAKM
+    /*
+    SAKM_perturbation<<<gpu_grid, gpu_block, k*dim*sizeof(double)>>>(
+        dev_points,
+        dev_centers,
+        n, k, dim,
+        dev_points_clusters, 
+        dev_points_clusters_old, 
+        devStates);
+    //printf("SA Kernel Check: %s\n", gpu_get_last_errmsg());
+    cudaDeviceSynchronize();
     */
 
+    dim3 gpu_grid_c((k + 32 - 1)/32, 1);
+    dim3 gpu_block_c(32, 1);
+    SAGM_perturbation<<<gpu_grid_c, gpu_block_c>>>(dev_centers, k, dim, devStates);
+    //printf("SAGM Kernel Check: %s\n", gpu_get_last_errmsg());
+    cudaDeviceSynchronize();
+
+    // assign points to clusters - step 1
+    find_cluster_on_gpu<<<gpu_grid,gpu_block, k*dim*sizeof(double)>>>(
+        dev_points,
+        dev_centers,
+        n, k, dim,
+        dev_points_clusters);
+    cudaDeviceSynchronize();
+    
+    // update means - step 2
+    cublasDgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                k, dim, n,
+                &alpha,
+                dev_points_clusters, n,
+                dev_points, n,
+                &beta,
+                dev_new_centers, k);
+    
+    cublasDgemv(handle, CUBLAS_OP_T,
+                n, k,
+                &alpha,
+                dev_points_clusters, n,
+                dev_ones, 1,
+                &beta,
+                dev_points_in_cluster, 1);
+    
+    // Update centers based on counted points
+    update_center_on_gpu<<<gpu_grid,gpu_block>>>(
+        n, k, dim,
+        dev_new_centers,
+        dev_points_in_cluster);
+    cudaDeviceSynchronize();
+    
+
+    // Evaluate current solution
+    double cost = evaluate_solution(dev_points, dev_new_centers, dev_points_clusters, 
+                                  dev_centers_of_points, dev_points_help,
+                                  n, k, dim, 
+                                  gpu_grid, gpu_block, 
+                                  handle, stat);
+    
+
+    //SAGM Paper notes that the cost function is the SSE (sum of squared error)
+    // In order to calculate the SSE we need to 
+
+    /*
+    //Check for convergence with CUBLAS
+    double check = 0.0;
+    //First subtract the dev_center arrays
+    alpha = -1.0;
+    cudaMemcpy(dev_temp_centers, dev_centers, sizeof(double)*k*dim, cudaMemcpyDeviceToDevice);
+    cublasDaxpy(handle, k*dim, &alpha, dev_new_centers, 1, dev_temp_centers, 1);
+    //Now find the norm2 of the new_centers
+    cublasDnrm2(handle, k*dim, dev_temp_centers, 1, &check);
+
+
+    */
     return cost;
 }

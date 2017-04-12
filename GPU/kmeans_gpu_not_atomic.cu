@@ -145,18 +145,19 @@ int main(int argc, char *argv[]) {
     //for dataset 100_5_2_0 from my random generator start=100000 and final=50000 work good.
     double start_temp = 100000.0;
     double temp = start_temp/log(1 + step);
-    double final_temp = 50000.0;
-    int eq_iterations = 2000;
+    double final_temp = 90000.0;
+    int eq_iterations = 100;
     double best_cost = DBL_MAX;
     bool best_found = false;
 
     //SA loop
+    printf("SA Filtering \n");
     while(temp > final_temp) {
         best_found = false;
         //printf("SA Temp: %lf \n", temp);
         //Sample solution space with SA
         for (i=0; i<eq_iterations; i++) {
-            double cost = kmeans_on_gpu(
+            double cost = kmeans_on_gpu_SA(
                         dev_points,
                         dev_centers,
                         n, k, dim,
@@ -180,9 +181,6 @@ int main(int argc, char *argv[]) {
                 best_cost = cost;
                 best_found = true;
                 printf("Found new best Solution %20.8lf at Temp %lf, instance %d \n", best_cost, temp, i);
-                //Copy results from GPU 
-                copy_from_gpu(staging_centers, dev_new_centers, k*dim*sizeof(double));
-                copy_from_gpu(points_clusters, dev_points_clusters, n*k*sizeof(double));
                 //Store results to temp_centers
                 cudaMemcpy(dev_temp_centers, dev_new_centers, k*dim*sizeof(double), cudaMemcpyDeviceToDevice);
                 //Try with pointer swap
@@ -204,6 +202,41 @@ int main(int argc, char *argv[]) {
         temp = start_temp/log(1 + step);
     }
 
+    /*
+        PROPER K-MEANS ALGORITHM IS CALLED HERE
+    */
+
+    //Restore best solution as a start
+    cudaMemcpy(dev_centers, dev_temp_centers, k*dim*sizeof(double), cudaMemcpyDeviceToDevice);
+    
+    printf("Proper KMeans Algorithm \n");
+    while (!check) {
+        kmeans_on_gpu(
+                    dev_points,
+                    dev_centers,
+                    n, k, dim,
+                    dev_points_clusters,
+                    dev_points_in_cluster,
+                    dev_new_centers,
+                    dev_check,
+                    BLOCK_SIZE,
+                    handle,
+                    stat,
+                    dev_ones,
+                    dev_temp_centers);
+    
+        copy_from_gpu(&check, dev_check, sizeof(int));
+        
+        printf("Step %d Check: %d \n", step, check);
+        //if (check < EPS) break;
+        
+        step += 1;
+    }
+
+
+
+    // POST PROCESSING
+
     double time_elapsed = (double)(clock() - start) / CLOCKS_PER_SEC;
     printf("Total Time Elapsed: %lf seconds\n", time_elapsed);
     
@@ -216,7 +249,7 @@ int main(int argc, char *argv[]) {
     
         
     // print & save results
-    
+    copy_from_gpu(staging_centers, dev_new_centers, k*dim*sizeof(double));
     f = fopen("centers.out", "w");
     printf("Centers:\n");
     for (i = 0; i < k; i++) {
@@ -230,6 +263,7 @@ int main(int argc, char *argv[]) {
     fclose(f);
     
     //Store Mapping Data in case we need it
+    copy_from_gpu(points_clusters, dev_points_clusters, n*k*sizeof(double));
     f = fopen("point_cluster_map.out", "w");
     for (i =0;i<k;i++){
         for (j=0;j<n;j++){

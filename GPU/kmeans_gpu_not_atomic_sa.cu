@@ -15,6 +15,9 @@
 //#define BLOCK_SIZE 256
 
 #define DIMENSION 2
+#define KMEANS
+#define SA
+#define MINI_BATCHES
 
 int main(int argc, char *argv[]) {
     
@@ -59,6 +62,7 @@ int main(int argc, char *argv[]) {
     int grid_size = (n+BLOCK_SIZE-1)/BLOCK_SIZE;
     dim3 gpu_grid(grid_size, 1);
     dim3 gpu_block(BLOCK_SIZE, 1);
+    int thread_num = grid_size * BLOCK_SIZE;
     
     printf("Grid size : %dx%d\n", gpu_grid.x, gpu_grid.y);
     printf("Block size: %dx%d\n", gpu_block.x, gpu_block.y);
@@ -80,6 +84,7 @@ int main(int argc, char *argv[]) {
     double *dev_points_help;
     double *dev_new_centers;
     double *dev_points_clusters;
+    int *dev_points_clusters_old;
     double *dev_points_in_cluster;
     double *dev_ones;
     //RNG CUDA States
@@ -90,6 +95,7 @@ int main(int argc, char *argv[]) {
     dev_centers_of_points = (double *) gpu_alloc(n*dim*sizeof(double));
     dev_points_in_cluster = (double *) gpu_alloc(k*sizeof(double));
     dev_points_clusters = (double *) gpu_alloc(n*k*sizeof(double));
+    dev_points_clusters_old = (int *) gpu_alloc(n*sizeof(int)); //Used for SA SAKM
     dev_new_centers = (double *) gpu_alloc(k*dim*sizeof(double));
     dev_ones = (double *) gpu_alloc(n*sizeof(double));
     dev_points_help = (double *) gpu_alloc(n*sizeof(double));
@@ -97,7 +103,6 @@ int main(int argc, char *argv[]) {
     printf("GPU allocs done \n");
     
     call_create_dev_ones(dev_ones, n, gpu_grid, gpu_block);
-
     // Transpose points and centers for cublas
     // TODO: Transpose at cublas in gpu
     double * staging_points = (double*) calloc(n*dim, sizeof(double));
@@ -117,93 +122,153 @@ int main(int argc, char *argv[]) {
         return -1;
     }
 
+    //Setup Random States
+    cudaMalloc(&devStates,  thread_num * sizeof(curandState));
+    setup_RNG_states(devStates, gpu_grid, gpu_block);
+
+    //Init the result_cluster arrays once 
+    init_point_clusters(dev_points, dev_centers, 
+                        n, k, dim, 
+                        gpu_grid, gpu_block,
+                        dev_points_clusters, dev_points_clusters_old, 
+                        devStates);
+
     // FIXME: For now we pass TWO matrices for centers, one normal and 
     //        one transposed. The transposed can be omitted by doing some
     //        changes in Step 1 of K-Means.
-    double *dev_temp_centers;
+    double *dev_temp_centers,  *dev_temp_points_clusters;
     dev_temp_centers = (double *) gpu_alloc(k*dim*sizeof(double));
+    dev_temp_points_clusters = (double *) gpu_alloc(n*k*sizeof(double));
 
-    printf("Loop Start \n");
-    
     int step = 1;
     int check = 0;
     int* dev_check = (int *) gpu_alloc(sizeof(int));
     double* dev_cost = (double *) gpu_alloc(sizeof(double));
 
+    // printf("Loop Start \n");
     // Debug
-    for(i=0;i<k;i++){
-        for(j=0;j<dim;j++)
-            printf("%lf,\t", centers[i][j]);
-        printf("\n");
-    }
+    // for(i=0;i<k;i++){
+    //     for(j=0;j<k*dim;j+=k)
+    //         printf("%lf,\t", staging_centers[j + i]);
+    //     printf("\n");
+    // }
     srand(unsigned(time(NULL)));
 
+    /*
+            SA & K-MEANS ALGORITHM
+        
+    */
     //SA config
     //SA starting temperature should be set so that the probablities of making moves on the very
     //first iteration should be very close to 1.
-    //So this probably will need some tuning depending on the dataset
-    //for the input.in start=100 and final=50, are working great
-    //for dataset 100_5_2_0 from my random generator start=100000 and final=50000 work good.
-    double start_temp = 100000.0;
-    double temp = start_temp/log(1 + step);
-    double final_temp = 50000.0;
-    int eq_iterations = 1800;
+    //Start temp of 100 seems to be working good for the tested datasets
+    double start_temp = 100.0;
+    double temp = start_temp;
+    int eq_iterations = 100;
     double best_cost = DBL_MAX;
-    bool best_found = false;
 
+#ifdef SA
     //SA loop
-    while(temp > final_temp) {
-        best_found = false;
+    printf("Starting SA on GPU \n");
+    int eq_counter = 0;
+    while(eq_counter < eq_iterations) {
+        
         //printf("SA Temp: %lf \n", temp);
         //Sample solution space with SA
-        for (i=0; i<eq_iterations; i++) {
-            double cost = kmeans_on_gpu(
+        double cost = kmeans_on_gpu_SA(
+                    dev_points,
+                    dev_centers,
+                    n, k, dim,
+                    dev_points_clusters,
+                    dev_points_clusters_old,
+                    dev_points_in_cluster,
+                    dev_centers_of_points,
+                    dev_new_centers,
+                    dev_check,
+                    gpu_grid, 
+                    gpu_block, 
+                    handle,
+                    stat,
+                    dev_ones,
+                    dev_points_help, 
+                    dev_temp_centers, 
+                    devStates, 
+                    temp);
+
+        //Acceptance checks
+        if (cost <= best_cost){
+            //Accept the solution immediately        
+            //Found better solution
+            best_cost = cost;
+            //printf("Found Better Solution: %lf Temp %lf\n", cost, temp);
+            cudaMemcpy(dev_centers, dev_new_centers, sizeof(double)*k*dim, cudaMemcpyDeviceToDevice);
+            //Storing global best to temp_centers
+            cudaMemcpy(dev_temp_centers, dev_new_centers, sizeof(double)*k*dim, cudaMemcpyDeviceToDevice);
+            cudaMemcpy(dev_temp_points_clusters, dev_points_clusters, sizeof(double)*k*n, cudaMemcpyDeviceToDevice);
+            
+        } else {
+            //Accept the solution with probability
+            double accept_factor = 1.0; // The larger the factor the less the probability becomes
+            //Increasing the factor is equivalent with decreasing the start_temp
+
+            double prob = exp(-accept_factor*(cost - best_cost)/start_temp);
+            double uniform = rand() / (RAND_MAX + 1.);
+            if (prob > uniform){
+                //Accept solution as the current one
+                // printf("Accepting with Prob: %lf Diff %lf\n", prob, cost - best_cost);
+                cudaMemcpy(dev_centers, dev_new_centers, sizeof(double)*k*dim, cudaMemcpyDeviceToDevice);
+            }
+        }
+        step += 1;
+        eq_counter++;
+    }
+    //Storing global best to temp_centers
+    cudaMemcpy(dev_centers, dev_temp_centers, sizeof(double)*k*dim, cudaMemcpyDeviceToDevice);
+    cudaMemcpy(dev_points_clusters, dev_temp_points_clusters, sizeof(double)*k*n, cudaMemcpyDeviceToDevice);
+    printf("SA Steps %d \n", step);
+#endif
+
+    /*
+        DEFAULT K-MEANS ALGORITHM
+    
+    */
+#ifdef KMEANS
+    
+    step = 0;
+    printf("Proper KMeans Algorithm \n");
+    while (!check) {
+        double cost = kmeans_on_gpu(
                         dev_points,
                         dev_centers,
                         n, k, dim,
                         dev_points_clusters,
                         dev_points_in_cluster,
-                        dev_centers_of_points,
+                        dev_centers_of_points, 
                         dev_new_centers,
                         dev_check,
-                        dev_cost, 
                         BLOCK_SIZE,
                         handle,
                         stat,
                         dev_ones,
                         dev_points_help, 
-                        dev_temp_centers, 
-                        devStates, 
-                        temp);
-
-            //Check Solution and download it if its the current best
-            if (best_cost - cost > EPS){
-                best_cost = cost;
-                best_found = true;
-                printf("Found new best Solution %20.8lf at Temp %lf, instance %d \n", best_cost, temp, i);
-                //Copy results from GPU 
-                copy_from_gpu(staging_centers, dev_new_centers, k*dim*sizeof(double));
-                copy_from_gpu(points_clusters, dev_points_clusters, n*k*sizeof(double));
-                //Store results to temp_centers
-                cudaMemcpy(dev_temp_centers, dev_new_centers, k*dim*sizeof(double), cudaMemcpyDeviceToDevice);
-                //Try with pointer swap
-                //...PENDING...
-            }
-        }
-
-        //Update centers with the current best ones
-        if (best_found){
-            cudaMemcpy(dev_centers, dev_temp_centers, k*dim*sizeof(double), cudaMemcpyDeviceToDevice);
-            //Try with pointer swap
-            //...PENDING...
-        }
+                        dev_temp_centers);
         
+        copy_from_gpu(&check, dev_check, sizeof(int));
+        //printf("Step %4d Check: %d Cost: %lf \n", step, check, cost);
         step += 1;
-        //break;
-
-        //Cooling schedule
-        temp = start_temp/log(1 + step);
     }
+    printf("KMeans algorithm steps %d \n", step);
+#endif
+
+
+    //Post Processing
+    double eval = evaluate_solution(dev_points, dev_centers, dev_points_clusters, 
+                  dev_centers_of_points, dev_points_help, 
+                  n, k, dim, 
+                  gpu_grid, gpu_block, 
+                  handle, stat);
+
+    printf("Final Solution Value: %lf \n", eval);
 
     double time_elapsed = (double)(clock() - start) / CLOCKS_PER_SEC;
     printf("Total Time Elapsed: %lf seconds\n", time_elapsed);
@@ -215,9 +280,8 @@ int main(int argc, char *argv[]) {
     fprintf(f, "Time Elapsed: %lf ", time_elapsed);
     fclose(f);
     
-        
     // print & save results
-    
+    copy_from_gpu(staging_centers, dev_new_centers, k*dim*sizeof(double));
     f = fopen("centers.out", "w");
     printf("Centers:\n");
     for (i = 0; i < k; i++) {
@@ -231,6 +295,7 @@ int main(int argc, char *argv[]) {
     fclose(f);
     
     //Store Mapping Data in case we need it
+    copy_from_gpu(points_clusters, dev_points_clusters, n*k*sizeof(double));
     f = fopen("point_cluster_map.out", "w");
     for (i =0;i<k;i++){
         for (j=0;j<n;j++){
@@ -244,10 +309,13 @@ int main(int argc, char *argv[]) {
     // GPU clean
     gpu_free(dev_centers);
     gpu_free(dev_new_centers);
+    gpu_free(dev_temp_centers);
     gpu_free(dev_points);
     gpu_free(dev_points_clusters);
+    gpu_free(dev_temp_points_clusters);
     gpu_free(dev_points_in_cluster);
     gpu_free(dev_centers_of_points);
+    gpu_free(devStates);
 
     stat = cublasDestroy(handle);
     if (stat != CUBLAS_STATUS_SUCCESS) {
