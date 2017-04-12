@@ -14,11 +14,18 @@ Please take over as many tasks as you can
 - (Sklikas) Reduce used registers number
 - (Sklikas) Change where centers are saved in memory (Textures, constant)
 
+## Report
+- (Tsatiris) First Draft
+
 ## Evaluation
 - (Kallas) Find dataset with many dimension 
-- (Kallas) Automate evaluation 
+
+### Automate evaluation
+- **(OK)** Write a script that executes all implementations for all datasets
+- (Kallas) Improve the script by keeping the size and dimensionality of each dataset so that we can understand the efficiency of the algorithm for different parametrizations
+- Integrate the script with the gpu implementations of the algorithm
 
 ## Algorithm
-- Simulated Annealing
+- (Greg) Simulated Annealing
 - Boruvka
 - Yin Yang Kmeans
